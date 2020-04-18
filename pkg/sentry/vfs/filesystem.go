@@ -346,7 +346,10 @@ type FilesystemImpl interface {
 	// ENOTEMPTY.
 	//
 	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink(). oldName is not "." or "..".
+	// !rp.ShouldFollowSymlink(). oldParentVD.Dentry() was obtained from a
+	// previous call to
+	// oldParentVD.Mount().Filesystem().Impl().GetParentDentryAt(). oldName is
+	// not "." or "..".
 	//
 	// Postconditions: If RenameAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -440,8 +443,7 @@ type FilesystemImpl interface {
 	// Errors:
 	//
 	// - If extended attributes are not supported by the filesystem,
-	// ListxattrAt returns nil. (See FileDescription.Listxattr for an
-	// explanation.)
+	// ListxattrAt returns ENOTSUP.
 	//
 	// - If the size of the list (including a NUL terminating byte after every
 	// entry) would exceed size, ERANGE may be returned. Note that

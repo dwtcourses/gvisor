@@ -102,11 +102,12 @@ type filesystem struct {
 	cachedDentries    dentryList
 	cachedDentriesLen uint64
 
-	// dentries contains all dentries in this filesystem. specialFileFDs
-	// contains all open specialFileFDs. These fields are protected by syncMu.
-	syncMu         sync.Mutex
-	dentries       map[*dentry]struct{}
-	specialFileFDs map[*specialFileFD]struct{}
+	// syncableDentries contains all dentries in this filesystem for which
+	// !dentry.file.isNil(). specialFileFDs contains all open specialFileFDs.
+	// These fields are protected by syncMu.
+	syncMu           sync.Mutex
+	syncableDentries map[*dentry]struct{}
+	specialFileFDs   map[*specialFileFD]struct{}
 }
 
 type filesystemOptions struct {
@@ -376,14 +377,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	// Construct the filesystem object.
 	fs := &filesystem{
-		mfp:            mfp,
-		opts:           fsopts,
-		uid:            creds.EffectiveKUID,
-		gid:            creds.EffectiveKGID,
-		client:         client,
-		clock:          ktime.RealtimeClockFromContext(ctx),
-		dentries:       make(map[*dentry]struct{}),
-		specialFileFDs: make(map[*specialFileFD]struct{}),
+		mfp:              mfp,
+		opts:             fsopts,
+		uid:              creds.EffectiveKUID,
+		gid:              creds.EffectiveKGID,
+		client:           client,
+		clock:            ktime.RealtimeClockFromContext(ctx),
+		syncableDentries: make(map[*dentry]struct{}),
+		specialFileFDs:   make(map[*specialFileFD]struct{}),
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
@@ -409,7 +410,7 @@ func (fs *filesystem) Release() {
 	mf := fs.mfp.MemoryFile()
 
 	fs.syncMu.Lock()
-	for d := range fs.dentries {
+	for d := range fs.syncableDentries {
 		d.handleMu.Lock()
 		d.dataMu.Lock()
 		if d.handleWritable {
@@ -444,17 +445,33 @@ type dentry struct {
 	vfsd vfs.Dentry
 
 	// refs is the reference count. Each dentry holds a reference on its
-	// parent, even if disowned. refs is accessed using atomic memory
-	// operations. When refs reaches 0, the dentry may be added to the cache or
-	// destroyed. If refs==-1 the dentry has already been destroyed.
+	// parent, even if disowned. Dentries only hold references on their
+	// children if they are synthetic (dentry.file.isNil()). When refs reaches
+	// 0, the dentry may be added to the cache or destroyed. If refs == -1, the
+	// dentry has already been destroyed. refs is accessed using atomic memory
+	// operations.
 	refs int64
 
 	// fs is the owning filesystem. fs is immutable.
 	fs *filesystem
 
+	// parent is this dentry's parent directory. Each dentry holds a reference
+	// on its parent. If this dentry is a filesystem root, parent is nil.
+	// parent is protected by filesystem.renameMu.
+	parent *dentry
+
+	// name is the name of this dentry in its parent. If this dentry is a
+	// filesystem root, name is the empty string. name is protected by
+	// filesystem.renameMu.
+	name string
+
 	// We don't support hard links, so each dentry maps 1:1 to an inode.
 
 	// file is the unopened p9.File that backs this dentry. file is immutable.
+	//
+	// If file.isNil(), this dentry represents a file that does not exist on
+	// the remote filesystem. As of this writing, this is only possible for a
+	// directory created with MkdirOptions.ForSyntheticMountpoint == true.
 	file p9file
 
 	// If deleted is non-zero, the file represented by this dentry has been
@@ -469,15 +486,24 @@ type dentry struct {
 
 	dirMu sync.Mutex
 
-	// If this dentry represents a directory, and InteropModeShared is not in
-	// effect, negativeChildren is a set of child names in this directory that
-	// are known not to exist. negativeChildren is protected by dirMu.
-	negativeChildren map[string]struct{}
+	// If this dentry represents a directory, children contains:
+	//
+	// - Mappings of child filenames to dentries representing those children.
+	//
+	// - Mappings of child filenames that are known not to exist to nil
+	// dentries (only if InteropModeShared is not in effect).
+	//
+	// children is protected by dirMu.
+	children map[string]*dentry
 
-	// If this dentry represents a directory, InteropModeShared is not in
-	// effect, and dirents is not nil, it is a cache of all entries in the
-	// directory, in the order they were returned by the server. dirents is
+	// If this dentry represents a directory, syntheticChildren is the number
+	// of child dentries for which dentry.file == nil. syntheticChildren is
 	// protected by dirMu.
+	syntheticChildren int
+
+	// If this dentry represents a directory and dirents is not nil, it is a
+	// cache of all entries in the directory, in the order they were returned
+	// by the server. dirents is protected by dirMu.
 	dirents []vfs.Dirent
 
 	// Cached metadata; protected by metadataMu and accessed using atomic
@@ -574,6 +600,8 @@ func dentryAttrMask() p9.AttrMask {
 // initially has no references, but is not cached; it is the caller's
 // responsibility to set the dentry's reference count and/or call
 // dentry.checkCachingLocked() as appropriate.
+//
+// Preconditions: !file.isNil().
 func (fs *filesystem) newDentry(ctx context.Context, file p9file, qid p9.QID, mask p9.AttrMask, attr *p9.Attr) (*dentry, error) {
 	if !mask.Mode {
 		ctx.Warningf("can't create gofer.dentry without file type")
@@ -597,10 +625,10 @@ func (fs *filesystem) newDentry(ctx context.Context, file p9file, qid p9.QID, ma
 		},
 	}
 	d.pf.dentry = d
-	if mask.UID {
+	if mask.UID && attr.UID != auth.NoID {
 		d.uid = uint32(attr.UID)
 	}
-	if mask.GID {
+	if mask.GID && attr.GID != auth.NoID {
 		d.gid = uint32(attr.GID)
 	}
 	if mask.Size {
@@ -627,7 +655,7 @@ func (fs *filesystem) newDentry(ctx context.Context, file p9file, qid p9.QID, ma
 	d.vfsd.Init(d)
 
 	fs.syncMu.Lock()
-	fs.dentries[d] = struct{}{}
+	fs.syncableDentries[d] = struct{}{}
 	fs.syncMu.Unlock()
 	return d, nil
 }
@@ -676,6 +704,7 @@ func (d *dentry) updateFromP9Attrs(mask p9.AttrMask, attr *p9.Attr) {
 	d.metadataMu.Unlock()
 }
 
+// Preconditions: !d.file.isNil().
 func (d *dentry) updateFromGetattr(ctx context.Context) error {
 	// Use d.handle.file, which represents a 9P fid that has been opened, in
 	// preference to d.file, which represents a 9P fid that has not. This may
@@ -743,7 +772,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 	defer mnt.EndWrite()
 	setLocalAtime := false
 	setLocalMtime := false
-	if d.fs.opts.interop != InteropModeShared {
+	if d.fs.opts.interop != InteropModeShared || d.file.isNil() {
 		// Timestamp updates will be handled locally.
 		setLocalAtime = stat.Mask&linux.STATX_ATIME != 0
 		setLocalMtime = stat.Mask&linux.STATX_MTIME != 0
@@ -756,35 +785,37 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 	}
 	d.metadataMu.Lock()
 	defer d.metadataMu.Unlock()
-	if stat.Mask != 0 {
-		if err := d.file.setAttr(ctx, p9.SetAttrMask{
-			Permissions:        stat.Mask&linux.STATX_MODE != 0,
-			UID:                stat.Mask&linux.STATX_UID != 0,
-			GID:                stat.Mask&linux.STATX_GID != 0,
-			Size:               stat.Mask&linux.STATX_SIZE != 0,
-			ATime:              stat.Mask&linux.STATX_ATIME != 0,
-			MTime:              stat.Mask&linux.STATX_MTIME != 0,
-			ATimeNotSystemTime: stat.Atime.Nsec != linux.UTIME_NOW,
-			MTimeNotSystemTime: stat.Mtime.Nsec != linux.UTIME_NOW,
-		}, p9.SetAttr{
-			Permissions:      p9.FileMode(stat.Mode),
-			UID:              p9.UID(stat.UID),
-			GID:              p9.GID(stat.GID),
-			Size:             stat.Size,
-			ATimeSeconds:     uint64(stat.Atime.Sec),
-			ATimeNanoSeconds: uint64(stat.Atime.Nsec),
-			MTimeSeconds:     uint64(stat.Mtime.Sec),
-			MTimeNanoSeconds: uint64(stat.Mtime.Nsec),
-		}); err != nil {
-			return err
+	if !d.file.isNil() {
+		if stat.Mask != 0 {
+			if err := d.file.setAttr(ctx, p9.SetAttrMask{
+				Permissions:        stat.Mask&linux.STATX_MODE != 0,
+				UID:                stat.Mask&linux.STATX_UID != 0,
+				GID:                stat.Mask&linux.STATX_GID != 0,
+				Size:               stat.Mask&linux.STATX_SIZE != 0,
+				ATime:              stat.Mask&linux.STATX_ATIME != 0,
+				MTime:              stat.Mask&linux.STATX_MTIME != 0,
+				ATimeNotSystemTime: stat.Atime.Nsec != linux.UTIME_NOW,
+				MTimeNotSystemTime: stat.Mtime.Nsec != linux.UTIME_NOW,
+			}, p9.SetAttr{
+				Permissions:      p9.FileMode(stat.Mode),
+				UID:              p9.UID(stat.UID),
+				GID:              p9.GID(stat.GID),
+				Size:             stat.Size,
+				ATimeSeconds:     uint64(stat.Atime.Sec),
+				ATimeNanoSeconds: uint64(stat.Atime.Nsec),
+				MTimeSeconds:     uint64(stat.Mtime.Sec),
+				MTimeNanoSeconds: uint64(stat.Mtime.Nsec),
+			}); err != nil {
+				return err
+			}
 		}
-	}
-	if d.fs.opts.interop == InteropModeShared {
-		// There's no point to updating d's metadata in this case since it'll
-		// be overwritten by revalidation before the next time it's used
-		// anyway. (InteropModeShared inhibits client caching of regular file
-		// data, so there's no cache to truncate either.)
-		return nil
+		if d.fs.opts.interop == InteropModeShared {
+			// There's no point to updating d's metadata in this case since
+			// it'll be overwritten by revalidation before the next time it's
+			// used anyway. (InteropModeShared inhibits client caching of
+			// regular file data, so there's no cache to truncate either.)
+			return nil
+		}
 	}
 	now := d.fs.clock.Now().Nanoseconds()
 	if stat.Mask&linux.STATX_MODE != 0 {
@@ -882,6 +913,15 @@ func (d *dentry) DecRef() {
 	}
 }
 
+// decRefLocked decrements d's reference count without calling
+// d.checkCachingLocked, even if d's reference count reaches 0; callers are
+// responsible for ensuring that d.checkCachingLocked will be called later.
+func (d *dentry) decRefLocked() {
+	if refs := atomic.AddInt64(&d.refs, -1); refs < 0 {
+		panic("gofer.dentry.decRefLocked() called without holding a reference")
+	}
+}
+
 // checkCachingLocked should be called after d's reference count becomes 0 or it
 // becomes disowned.
 //
@@ -910,9 +950,9 @@ func (d *dentry) checkCachingLocked() {
 		// Dentry has already been destroyed.
 		return
 	}
-	// Non-child dentries with zero references are no longer reachable by path
-	// resolution and should be dropped immediately.
-	if d.vfsd.Parent() == nil || d.vfsd.IsDisowned() {
+	// Deleted and invalidated dentries with zero references are no longer
+	// reachable by path resolution and should be dropped immediately.
+	if d.vfsd.IsDead() {
 		if d.cached {
 			d.fs.cachedDentries.Remove(d)
 			d.fs.cachedDentriesLen--
@@ -937,28 +977,26 @@ func (d *dentry) checkCachingLocked() {
 		d.fs.cachedDentries.Remove(victim)
 		d.fs.cachedDentriesLen--
 		victim.cached = false
-		// victim.refs may have become non-zero from an earlier path
-		// resolution since it was inserted into fs.cachedDentries; see
-		// dentry.incRefLocked(). Either way, we brought
-		// fs.cachedDentriesLen back down to fs.opts.maxCachedDentries, so
-		// we don't loop.
+		// victim.refs may have become non-zero from an earlier path resolution
+		// since it was inserted into fs.cachedDentries.
 		if atomic.LoadInt64(&victim.refs) == 0 {
-			if victimParentVFSD := victim.vfsd.Parent(); victimParentVFSD != nil {
-				victimParent := victimParentVFSD.Impl().(*dentry)
-				victimParent.dirMu.Lock()
-				if !victim.vfsd.IsDisowned() {
-					// victim can't be a mount point (in any mount
-					// namespace), since VFS holds references on mount
-					// points.
-					d.fs.vfsfs.VirtualFilesystem().ForceDeleteDentry(&victim.vfsd)
+			if victim.parent != nil {
+				victim.parent.dirMu.Lock()
+				if !victim.vfsd.IsDead() {
+					// Note that victim can't be a mount point (in any mount
+					// namespace), since VFS holds references on mount points.
+					d.fs.vfsfs.VirtualFilesystem().InvalidateDentry(&victim.vfsd)
+					delete(victim.parent.children, victim.name)
 					// We're only deleting the dentry, not the file it
 					// represents, so we don't need to update
 					// victimParent.dirents etc.
 				}
-				victimParent.dirMu.Unlock()
+				victim.parent.dirMu.Unlock()
 			}
 			victim.destroyLocked()
 		}
+		// Whether or not victim was destroyed, we brought fs.cachedDentriesLen
+		// back down to fs.opts.maxCachedDentries, so we don't loop.
 	}
 }
 
@@ -1000,17 +1038,16 @@ func (d *dentry) destroyLocked() {
 	if !d.file.isNil() {
 		d.file.close(ctx)
 		d.file = p9file{}
+		// Remove d from the set of syncable dentries.
+		d.fs.syncMu.Lock()
+		delete(d.fs.syncableDentries, d)
+		d.fs.syncMu.Unlock()
 	}
-	// Remove d from the set of all dentries.
-	d.fs.syncMu.Lock()
-	delete(d.fs.dentries, d)
-	d.fs.syncMu.Unlock()
-	// Drop the reference held by d on its parent.
-	if parentVFSD := d.vfsd.Parent(); parentVFSD != nil {
-		parent := parentVFSD.Impl().(*dentry)
-		// This is parent.DecRef() without recursive locking of d.fs.renameMu.
-		if refs := atomic.AddInt64(&parent.refs, -1); refs == 0 {
-			parent.checkCachingLocked()
+	// Drop the reference held by d on its parent without recursively locking
+	// d.fs.renameMu.
+	if d.parent != nil {
+		if refs := atomic.AddInt64(&d.parent.refs, -1); refs == 0 {
+			d.parent.checkCachingLocked()
 		} else if refs < 0 {
 			panic("gofer.dentry.DecRef() called without holding a reference")
 		}
@@ -1028,6 +1065,9 @@ func (d *dentry) setDeleted() {
 // We only support xattrs prefixed with "user." (see b/148380782). Currently,
 // there is no need to expose any other xattrs through a gofer.
 func (d *dentry) listxattr(ctx context.Context, creds *auth.Credentials, size uint64) ([]string, error) {
+	if d.file.isNil() {
+		return nil, nil
+	}
 	xattrMap, err := d.file.listXattr(ctx, size)
 	if err != nil {
 		return nil, err
@@ -1042,6 +1082,9 @@ func (d *dentry) listxattr(ctx context.Context, creds *auth.Credentials, size ui
 }
 
 func (d *dentry) getxattr(ctx context.Context, creds *auth.Credentials, opts *vfs.GetxattrOptions) (string, error) {
+	if d.file.isNil() {
+		return "", syserror.ENODATA
+	}
 	if err := d.checkPermissions(creds, vfs.MayRead); err != nil {
 		return "", err
 	}
@@ -1052,6 +1095,9 @@ func (d *dentry) getxattr(ctx context.Context, creds *auth.Credentials, opts *vf
 }
 
 func (d *dentry) setxattr(ctx context.Context, creds *auth.Credentials, opts *vfs.SetxattrOptions) error {
+	if d.file.isNil() {
+		return syserror.EPERM
+	}
 	if err := d.checkPermissions(creds, vfs.MayWrite); err != nil {
 		return err
 	}
@@ -1062,6 +1108,9 @@ func (d *dentry) setxattr(ctx context.Context, creds *auth.Credentials, opts *vf
 }
 
 func (d *dentry) removexattr(ctx context.Context, creds *auth.Credentials, name string) error {
+	if d.file.isNil() {
+		return syserror.EPERM
+	}
 	if err := d.checkPermissions(creds, vfs.MayWrite); err != nil {
 		return err
 	}
@@ -1071,7 +1120,7 @@ func (d *dentry) removexattr(ctx context.Context, creds *auth.Credentials, name 
 	return d.file.removeXattr(ctx, name)
 }
 
-// Preconditions: d.isRegularFile() || d.isDirectory().
+// Preconditions: !d.file.isNil(). d.isRegularFile() || d.isDirectory().
 func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool) error {
 	// O_TRUNC unconditionally requires us to obtain a new handle (opened with
 	// O_TRUNC).
@@ -1201,7 +1250,7 @@ func (fd *fileDescription) dentry() *dentry {
 func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	d := fd.dentry()
 	const validMask = uint32(linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_SIZE | linux.STATX_BLOCKS | linux.STATX_BTIME)
-	if d.fs.opts.interop == InteropModeShared && opts.Mask&(validMask) != 0 && opts.Sync != linux.AT_STATX_DONT_SYNC {
+	if d.fs.opts.interop == InteropModeShared && !d.file.isNil() && opts.Mask&validMask != 0 && opts.Sync != linux.AT_STATX_DONT_SYNC {
 		// TODO(jamieliu): Use specialFileFD.handle.file for the getattr if
 		// available?
 		if err := d.updateFromGetattr(ctx); err != nil {

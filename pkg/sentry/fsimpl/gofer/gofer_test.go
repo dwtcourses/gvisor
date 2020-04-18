@@ -24,7 +24,7 @@ import (
 
 func TestDestroyIdempotent(t *testing.T) {
 	fs := filesystem{
-		dentries: make(map[*dentry]struct{}),
+		syncableDentries: make(map[*dentry]struct{}),
 		opts: filesystemOptions{
 			// Test relies on no dentry being held in the cache.
 			maxCachedDentries: 0,
@@ -48,8 +48,7 @@ func TestDestroyIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.newDentry(): %v", err)
 	}
-	parent.IncRef() // reference held by child on its parent.
-	parent.vfsd.InsertChild(&child.vfsd, "child")
+	parent.cacheNewChildLocked(child, "child")
 
 	child.checkCachingLocked()
 	if got := atomic.LoadInt64(&child.refs); got != -1 {

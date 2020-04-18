@@ -21,21 +21,59 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/p9"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 func (d *dentry) isDir() bool {
 	return d.fileType() == linux.S_IFDIR
 }
 
+// Preconditions: filesystem.renameMu must be locked. d.dirMu must be locked.
+// d.isDir(). child must be a newly-created dentry that has never had a parent.
+func (d *dentry) cacheNewChildLocked(child *dentry, name string) {
+	d.IncRef() // reference held by child on its parent
+	child.parent = d
+	child.name = name
+	if d.children == nil {
+		d.children = make(map[string]*dentry)
+	}
+	d.children[name] = child
+}
+
 // Preconditions: d.dirMu must be locked. d.isDir(). fs.opts.interop !=
 // InteropModeShared.
 func (d *dentry) cacheNegativeChildLocked(name string) {
-	if d.negativeChildren == nil {
-		d.negativeChildren = make(map[string]struct{})
+	if d.children == nil {
+		d.children = make(map[string]*dentry)
 	}
-	d.negativeChildren[name] = struct{}{}
+	d.children[name] = nil
+}
+
+// createSyntheticDirectory creates a synthetic directory with the given name
+// in d.
+//
+// Preconditions: d.dirMu must be locked. d.isDir(). d does not already contain
+// a child with the given name.
+func (d *dentry) createSyntheticDirectoryLocked(name string, mode linux.FileMode, kuid auth.KUID, kgid auth.KGID) {
+	d2 := &dentry{
+		refs:      1, // held by d
+		fs:        d.fs,
+		mode:      uint32(mode) | linux.S_IFDIR,
+		uid:       uint32(kuid),
+		gid:       uint32(kgid),
+		blockSize: usermem.PageSize, // arbitrary
+		handle: handle{
+			fd: -1,
+		},
+	}
+	d2.pf.dentry = d2
+	d2.vfsd.Init(d2)
+
+	d.cacheNewChildLocked(d2, name)
+	d.syntheticChildren++
 }
 
 type directoryFD struct {
@@ -80,23 +118,21 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 
 // Preconditions: d.isDir(). There exists at least one directoryFD representing d.
 func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
-	// 9P2000.L's readdir does not specify behavior in the presence of
-	// concurrent mutation of an iterated directory, so implementations may
-	// duplicate or omit entries in this case, which violates POSIX semantics.
-	// Thus we read all directory entries while holding d.dirMu to exclude
-	// directory mutations. (Note that it is impossible for the client to
-	// exclude concurrent mutation from other remote filesystem users. Since
-	// there is no way to detect if the server has incorrectly omitted
-	// directory entries, we simply assume that the server is well-behaved
-	// under InteropModeShared.) This is inconsistent with Linux (which appears
-	// to assume that directory fids have the correct semantics, and translates
-	// struct file_operations::readdir calls directly to readdir RPCs), but is
-	// consistent with VFS1.
-	//
-	// NOTE(b/135560623): In particular, some gofer implementations may not
-	// retain state between calls to Readdir, so may not provide a coherent
-	// directory stream across in the presence of mutation.
+	// NOTE(b/135560623): 9P2000.L's readdir does not specify behavior in the
+	// presence of concurrent mutation of an iterated directory, so
+	// implementations may duplicate or omit entries in this case, which
+	// violates POSIX semantics. Thus we read all directory entries while
+	// holding d.dirMu to exclude directory mutations. (Note that it is
+	// impossible for the client to exclude concurrent mutation from other
+	// remote filesystem users. Since there is no way to detect if the server
+	// has incorrectly omitted directory entries, we simply assume that the
+	// server is well-behaved under InteropModeShared.) This is inconsistent
+	// with Linux (which appears to assume that directory fids have the correct
+	// semantics, and translates struct file_operations::readdir calls directly
+	// to readdir RPCs), but is consistent with VFS1.
 
+	// filesystem.renameMu is needed for d.parent, and must be locked before
+	// dentry.dirMu.
 	d.fs.renameMu.RLock()
 	defer d.fs.renameMu.RUnlock()
 	d.dirMu.Lock()
@@ -107,7 +143,7 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 
 	// It's not clear if 9P2000.L's readdir is expected to return "." and "..",
 	// so we generate them here.
-	parent := d.vfsd.ParentOrSelf().Impl().(*dentry)
+	parent := genericParentOrSelf(d)
 	dirents := []vfs.Dirent{
 		{
 			Name:    ".",
@@ -122,50 +158,81 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 			NextOff: 2,
 		},
 	}
-	off := uint64(0)
-	const count = 64 * 1024 // for consistency with the vfs1 client
-	d.handleMu.RLock()
-	defer d.handleMu.RUnlock()
-	if !d.handleReadable {
-		// This should not be possible because a readable handle should have
-		// been opened when the calling directoryFD was opened.
-		panic("gofer.dentry.getDirents called without a readable handle")
+	var realChildren map[string]struct{}
+	if d.syntheticChildren != 0 && d.fs.opts.interop == InteropModeShared {
+		// Record the set of children d actually has so that we don't emit
+		// duplicate entries for synthetic children.
+		realChildren = make(map[string]struct{})
 	}
-	for {
-		p9ds, err := d.handle.file.readdir(ctx, off, count)
-		if err != nil {
-			return nil, err
+	if !d.file.isNil() {
+		off := uint64(0)
+		const count = 64 * 1024 // for consistency with the vfs1 client
+		d.handleMu.RLock()
+		if !d.handleReadable {
+			// This should not be possible because a readable handle should
+			// have been opened when the calling directoryFD was opened.
+			d.handleMu.RUnlock()
+			panic("gofer.dentry.getDirents called without a readable handle")
 		}
-		if len(p9ds) == 0 {
-			// Cache dirents for future directoryFDs if permitted.
-			if d.fs.opts.interop != InteropModeShared {
-				d.dirents = dirents
+		for {
+			p9ds, err := d.handle.file.readdir(ctx, off, count)
+			if err != nil {
+				d.handleMu.RUnlock()
+				return nil, err
 			}
-			return dirents, nil
+			if len(p9ds) == 0 {
+				d.handleMu.RUnlock()
+				break
+			}
+			for _, p9d := range p9ds {
+				if p9d.Name == "." || p9d.Name == ".." {
+					continue
+				}
+				dirent := vfs.Dirent{
+					Name:    p9d.Name,
+					Ino:     p9d.QID.Path,
+					NextOff: int64(len(dirents) + 1),
+				}
+				// p9 does not expose 9P2000.U's DMDEVICE, DMNAMEDPIPE, or
+				// DMSOCKET.
+				switch p9d.Type {
+				case p9.TypeSymlink:
+					dirent.Type = linux.DT_LNK
+				case p9.TypeDir:
+					dirent.Type = linux.DT_DIR
+				default:
+					dirent.Type = linux.DT_REG
+				}
+				dirents = append(dirents, dirent)
+				if realChildren != nil {
+					realChildren[p9d.Name] = struct{}{}
+				}
+			}
+			off = p9ds[len(p9ds)-1].Offset
 		}
-		for _, p9d := range p9ds {
-			if p9d.Name == "." || p9d.Name == ".." {
+	}
+	// Emit entries for synthetic children.
+	if d.syntheticChildren != 0 {
+		for _, child := range d.children {
+			if !child.file.isNil() {
 				continue
 			}
-			dirent := vfs.Dirent{
-				Name:    p9d.Name,
-				Ino:     p9d.QID.Path,
+			if _, ok := realChildren[child.name]; ok {
+				continue
+			}
+			dirents = append(dirents, vfs.Dirent{
+				Name:    child.name,
+				Type:    uint8(atomic.LoadUint32(&child.mode) >> 12),
+				Ino:     child.ino,
 				NextOff: int64(len(dirents) + 1),
-			}
-			// p9 does not expose 9P2000.U's DMDEVICE, DMNAMEDPIPE, or
-			// DMSOCKET.
-			switch p9d.Type {
-			case p9.TypeSymlink:
-				dirent.Type = linux.DT_LNK
-			case p9.TypeDir:
-				dirent.Type = linux.DT_DIR
-			default:
-				dirent.Type = linux.DT_REG
-			}
-			dirents = append(dirents, dirent)
+			})
 		}
-		off = p9ds[len(p9ds)-1].Offset
 	}
+	// Cache dirents for future directoryFDs if permitted.
+	if d.fs.opts.interop != InteropModeShared || d.file.isNil() {
+		d.dirents = dirents
+	}
+	return dirents, nil
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek.
