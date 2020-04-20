@@ -363,16 +363,22 @@ type Connection struct {
 // reverse is never a match. override overrides the default matchers for each
 // Layer.
 func (conn *Connection) match(override, received Layers) bool {
-	if len(received) < len(conn.layerStates) {
+	if len(received) < len(override) {
 		return false
 	}
-	for i, s := range conn.layerStates {
-		toMatch := s.incoming(received[i])
-		if toMatch == nil {
-			return false
-		}
-		if i < len(override) {
-			toMatch.merge(override[i])
+	for i, l := range override {
+		var toMatch Layer
+		if i < len(conn.layerStates) {
+			s := conn.layerStates[i]
+			toMatch = s.incoming(received[i])
+			if toMatch == nil {
+				return false
+			}
+			if toMatch.merge(l) != nil {
+				return false
+			}
+		} else {
+			toMatch = l
 		}
 		if !toMatch.match(received[i]) {
 			return false
