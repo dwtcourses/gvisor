@@ -2205,9 +2205,15 @@ func (e *endpoint) listen(backlog int) *tcpip.Error {
 		}
 		origChan := e.acceptedChan
 		e.acceptedChan = make(chan *endpoint, backlog)
-		close(origChan)
-		for ep := range origChan {
-			e.acceptedChan <- ep
+		if e.rcvClosed {
+			// listen is called after shutdown.
+			e.rcvClosed = false
+			e.shutdownFlags = 0
+		} else {
+			close(origChan)
+			for ep := range origChan {
+				e.acceptedChan <- ep
+			}
 		}
 
 		// Notify any blocked goroutines that they can attempt to
